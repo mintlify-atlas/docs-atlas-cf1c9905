@@ -1,0 +1,203 @@
+---
+title: "Tenant resolution"
+description: "How the system identifies the current tenant from HTTP requests and propagates context through the service call chain."
+---
+
+Every request in this system must be associated with exactly one tenant. The tenant is determined at the Edge Service from the DNS subdomain and then propagated to downstream services as an HTTP header. Each service is responsible for reading that header, validating the tenant, and storing it in a thread-local context that all tenant-aware components can read.
+
+## Resolution pipeline
+
+<Steps>
+  <Step title="DNS subdomain identifies the tenant">
+    The system uses subdomain-based tenant routing. Clients access the system via URLs of the form `http://{tenant}.rock/...`, where the subdomain is the tenant identifier.
+
+    For local development, add the following entries to `/etc/hosts`:
+
+    ```bash
+    127.0.0.1       dukes.rock
+    127.0.0.1       beans.rock
+    ```
+
+    The subdomain carries the tenant identity in the DNS layer, before any application code runs.
+  </Step>
+  <Step title="Edge Service matches the tenant via Host predicate">
+    Spring Cloud Gateway evaluates the `Host={tenant}.rock` predicate against the incoming `Host` header. When the predicate matches, Gateway binds the subdomain to the `{tenant}` route variable.
+
+    ```yaml
+    routes:
+      - id: instrument-route
+        uri: http://localhost:8181
+        predicates:
+          - Host={tenant}.rock
+          - Path=/instruments/**
+        filters:
+          - AddRequestHeader=X-TenantId,{tenant}
+    ```
+
+    The `{tenant}` variable is then expanded by the `AddRequestHeader` filter (and by `TenantGatewayFilterFactory`) to produce the `X-TenantId` header value.
+  </Step>
+  <Step title="TenantGatewayFilterFactory injects X-TenantId">
+    `TenantGatewayFilterFactory` resolves the tenant identifier from the route variables on the exchange and adds it to the outgoing request headers. It also records `tenant.id` as a high-cardinality key in the observability context so that every span and metric emitted by the gateway is tagged with the tenant.
+
+    ```java
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String tenantId = ServerWebExchangeUtils.expand(exchange, config.getValue());
+        ServerHttpRequest request = addTenantToRequest(exchange, tenantId, config);
+        addTenantToObservation(tenantId, exchange);
+        return chain.filter(exchange.mutate().request(request).build());
+    }
+
+    private void addTenantToObservation(String tenantId, ServerWebExchange exchange) {
+        ServerHttpObservationFilter.findObservationContext(exchange).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+    }
+    ```
+
+    The downstream service receives an HTTP request that includes `X-TenantId: dukes` (or whichever tenant was resolved).
+  </Step>
+  <Step title="Downstream services read X-TenantId via TenantContextFilter">
+    Both the Instrument Service and the Chat Service use an identical `TenantContextFilter` that extends `OncePerRequestFilter`. On every non-actuator request, the filter:
+
+    1. Delegates to `HttpHeaderTenantResolver` to read the `X-TenantId` header.
+    2. Validates the tenant using `TenantDetailsService` (checks `enabled` flag).
+    3. Stores the identifier in `TenantContextHolder`.
+    4. Tags the SLF4J MDC with `tenantId` and the trace context with `tenant.id`.
+    5. Clears the context after the request completes.
+
+    ```java
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+            FilterChain filterChain) throws ServletException, IOException {
+        var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+        if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+            TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+            configureLogs(tenantIdentifier);
+            configureTraces(tenantIdentifier, request);
+        } else {
+            throw new TenantResolutionException(
+                "A valid tenant must be specified for requests to %s".formatted(request.getRequestURI()));
+        }
+
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            clear();
+        }
+    }
+    ```
+
+    The `shouldNotFilter` override excludes `/actuator/**` paths so that health checks and metrics endpoints remain accessible without a tenant header.
+  </Step>
+  <Step title="TenantContextHolder provides tenant to all components">
+    `TenantContextHolder` is a thread-local store. Any component running on the same thread as the request—Hibernate resolvers, cache key generators, vector store queries—reads the current tenant from it without needing the tenant passed as a parameter.
+
+    ```java
+    public final class TenantContextHolder {
+
+        private static final ThreadLocal<String> tenantIdentifier = new ThreadLocal<>();
+
+        public static void setTenantIdentifier(String tenant) {
+            Assert.hasText(tenant, "tenant cannot be empty");
+            tenantIdentifier.set(tenant);
+        }
+
+        public static String getRequiredTenantIdentifier() {
+            var tenant = getTenantIdentifier();
+            if (!StringUtils.hasText(tenant)) {
+                throw new TenantNotFoundException("No tenant found in the current context");
+            }
+            return tenant;
+        }
+
+        public static void clear() {
+            tenantIdentifier.remove();
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## HttpHeaderTenantResolver
+
+`HttpHeaderTenantResolver` is the component that performs the actual header read. It implements a generic `TenantResolver<HttpServletRequest>` strategy interface, making it straightforward to substitute a different resolution strategy (e.g., JWT claim, query parameter) without changing `TenantContextFilter`.
+
+```java
+@Component
+public class HttpHeaderTenantResolver implements TenantResolver<HttpServletRequest> {
+
+    private static final String TENANT_HEADER = "X-TenantId";
+
+    @Override
+    public String resolveTenantIdentifier(HttpServletRequest request) {
+        return request.getHeader(TENANT_HEADER);
+    }
+}
+```
+
+## The TenantDetails record
+
+Each service defines a `TenantDetails` record that represents the static configuration for a tenant. The fields vary slightly by service.
+
+**Edge Service** — includes OAuth2 client credentials:
+
+```java
+public record TenantDetails(
+    String identifier,
+    boolean enabled,
+    String clientId,
+    String clientSecret,
+    String issuer
+) {}
+```
+
+**Instrument Service** — includes the database schema name:
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+```
+
+All services share the `identifier` and `enabled` fields as the minimum tenant description.
+
+## Disabled tenants
+
+Tenants can be declared in configuration with `enabled: false`. The `trixie` tenant is an example:
+
+```yaml
+- identifier: trixie
+  enabled: false
+  client-id: edge-service
+  client-secret: rocking-secret
+  issuer: http://localhost:8080/realms/trixie
+```
+
+`TenantContextFilter` calls `isTenantValid()` before setting the context. If the tenant is disabled or not found, the filter throws a `TenantResolutionException` (Instrument Service) or `TenantNotFoundException` (Chat Service), and the request is rejected with an error response before any business logic runs.
+
+<Warning>
+  A request arriving with `X-TenantId: trixie` will be rejected by both the Instrument Service and the Chat Service because `trixie` has `enabled: false` in all service configurations.
+</Warning>
+
+## Observability context
+
+Tenant identity is written into three observability channels during resolution:
+
+| Channel | Key | Set by |
+|---|---|---|
+| SLF4J MDC | `tenantId` | `TenantContextFilter.configureLogs()` |
+| Micrometer trace span | `tenant.id` | `TenantContextFilter.configureTraces()` |
+| Gateway observation | `tenant.id` | `TenantGatewayFilterFactory.addTenantToObservation()` |
+
+The logging pattern in each service includes the tenant ID in every log line:
+
+```yaml
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+```
+
+This means that in Loki, every log line produced during a request is annotated with the tenant, making per-tenant log filtering straightforward.

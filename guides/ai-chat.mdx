@@ -1,0 +1,267 @@
+---
+title: "AI chat with multitenancy"
+description: "Implementing per-tenant AI chat using Spring AI, Ollama, and Chroma vector store."
+---
+
+## Overview
+
+The Chat Service provides two AI chat APIs backed by **Ollama** (running `llama2`) and a **Chroma** vector database. Tenant context is propagated through the same `X-TenantId` header mechanism used by the other services.
+
+<CardGroup cols={2}>
+  <Card title="Simple chat" icon="message">
+    Stateless chat endpoint that forwards user messages directly to Ollama with no document context.
+  </Card>
+  <Card title="Document chat (RAG)" icon="book">
+    Retrieval-augmented generation: fetches tenant-specific documents from Chroma before constructing the prompt.
+  </Card>
+</CardGroup>
+
+### Dependencies
+
+The Chat Service uses two Spring AI starters:
+
+```xml pom.xml
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-chroma-store-spring-boot-starter</artifactId>
+</dependency>
+```
+
+Ollama is configured to use `llama2` for both chat and embeddings:
+
+```yaml chat-service/src/main/resources/application.yml
+spring:
+  ai:
+    ollama:
+      chat:
+        model: llama2
+      embedding:
+        model: llama2
+```
+
+<Tip>
+Run Ollama locally with `ollama run llama2` before starting the Chat Service, or use the Testcontainers integration in the test sources to spin up Ollama automatically during tests.
+</Tip>
+
+---
+
+## Tenant context
+
+### TenantDetails
+
+The Chat Service's `TenantDetails` record is minimal — it only needs to know whether a tenant is enabled:
+
+```java TenantDetails.java
+public record TenantDetails(
+        String identifier,
+        boolean enabled
+) {}
+```
+
+Tenants are declared in `application.yml`:
+
+```yaml chat-service/src/main/resources/application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+    - identifier: beans
+      enabled: true
+    - identifier: trixie
+      enabled: false
+```
+
+### TenantContextFilter
+
+`TenantContextFilter` runs on every non-actuator request. It reads the `X-TenantId` header, validates the tenant is enabled, stores it in `TenantContextHolder`, enriches the MDC and observation context, then clears everything in a `finally` block:
+
+```java TenantContextFilter.java
+@Override
+protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+        FilterChain filterChain) throws ServletException, IOException {
+    var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+    if (StringUtils.hasText(tenantIdentifier)) {
+        if (!isTenantValid(tenantIdentifier)) {
+            throw new TenantNotFoundException();
+        }
+        TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+        configureLogs(tenantIdentifier);
+        configureTraces(tenantIdentifier, request);
+    } else {
+        throw new TenantResolutionException(
+                "A tenant must be specified for requests to %s".formatted(request.getRequestURI()));
+    }
+
+    try {
+        filterChain.doFilter(request, response);
+    } finally {
+        clear();
+    }
+}
+```
+
+---
+
+## Simple chat endpoint
+
+`SimpleChatController` exposes `POST /ai/simple/chat`. It passes the request body directly to the `ChatClient` and returns the model's response as a plain string:
+
+```java SimpleChatController.java
+@RestController
+public class SimpleChatController {
+
+    private final ChatClient chatClient;
+
+    @PostMapping("/ai/simple/chat")
+    String chat(@RequestBody String message) {
+        return chatClient.call(message);
+    }
+
+}
+```
+
+**Example request:**
+
+```bash
+curl -X POST http://localhost:8282/ai/simple/chat \
+  -H "Content-Type: text/plain" \
+  -H "X-TenantId: dukes" \
+  -d "Who are the Foo Fighters?"
+```
+
+---
+
+## Document chat endpoint (RAG)
+
+### DocumentChatController
+
+`DocumentChatController` exposes `POST /ai/doc/chat` and delegates to `DocumentChatService`:
+
+```java DocumentChatController.java
+@RestController
+class DocumentChatController {
+
+    private final DocumentChatService documentChatService;
+
+    @PostMapping("/ai/doc/chat")
+    String chatWithDocument(@RequestBody String input) {
+        return documentChatService.chatWithDocument(input).getContent();
+    }
+
+}
+```
+
+### DocumentChatService
+
+`DocumentChatService` implements the RAG pattern:
+
+<Steps>
+  <Step title="Retrieve tenant-specific documents">
+    Queries Chroma's `similaritySearch` with a filter expression `tenant == '{currentTenantId}'` to restrict results to the calling tenant's documents. Returns the top 3 matches.
+  </Step>
+  <Step title="Build the system prompt">
+    Injects the retrieved document contents into a `SystemPromptTemplate` that instructs the model to answer only from the provided material.
+  </Step>
+  <Step title="Call the model">
+    Sends the composed `Prompt` (system message + user message) to Ollama via `ChatClient` and returns the `AssistantMessage`.
+  </Step>
+</Steps>
+
+```java DocumentChatService.java
+@Service
+class DocumentChatService {
+
+    private final ChatClient chatClient;
+    private final VectorStore vectorStore;
+
+    AssistantMessage chatWithDocument(String message) {
+        var systemPromptTemplate = new SystemPromptTemplate("""
+                You're assisting with questions about rock bands, their story, their members, and their music.
+
+                Use the information from the DOCUMENTS section to provide accurate answers and assume no prior knowledge,
+                but act as if you knew this information innately. If unsure, simply state that you don't know.
+
+                DOCUMENTS:
+                {documents}
+                """);
+
+        List<Document> similarDocuments = vectorStore.similaritySearch(
+                SearchRequest
+                        .query(message)
+                        .withFilterExpression("tenant == '%s'"
+                                .formatted(TenantContextHolder.getRequiredTenantIdentifier()))
+                        .withTopK(3));
+
+        String documents = similarDocuments.stream()
+                .map(Document::getContent)
+                .collect(Collectors.joining(System.lineSeparator()));
+
+        Map<String,Object> model = Map.of("documents", documents);
+        var systemMessage = systemPromptTemplate.createMessage(model);
+        var userMessage = new UserMessage(message);
+        var prompt = new Prompt(List.of(systemMessage, userMessage));
+
+        return chatClient.call(prompt).getResult().getOutput();
+    }
+
+}
+```
+
+**Example request:**
+
+```bash
+curl -X POST http://localhost:8282/ai/doc/chat \
+  -H "Content-Type: text/plain" \
+  -H "X-TenantId: dukes" \
+  -d "Tell me about the band's origin story."
+```
+
+<Note>
+The Chroma filter expression `tenant == 'dukes'` ensures that only documents tagged for the `dukes` tenant are retrieved. Documents for other tenants are never surfaced in the response.
+</Note>
+
+---
+
+## Document initialization
+
+`DocumentInitializer` is a `@Component` with a `@PostConstruct` method that loads tenant-specific documents into Chroma when the application starts.
+
+Each source file is loaded with a `tenant` metadata key matching the tenant identifier. The documents are split into chunks by `TokenTextSplitter` before being embedded and stored:
+
+```java DocumentInitializer.java
+@PostConstruct
+public void run() {
+    List<Document> documents = new ArrayList<>();
+
+    log.info("Loading .md files as Documents (dukes)");
+    var textReader1 = new TextReader(textFile1);
+    textReader1.getCustomMetadata().put("tenant", "dukes");
+    textReader1.setCharset(Charset.defaultCharset());
+    documents.addAll(textReader1.get());
+
+    log.info("Loading .txt files as Documents (beans)");
+    var textReader2 = new TextReader(textFile2);
+    textReader2.getCustomMetadata().put("tenant", "beans");
+    textReader2.setCharset(Charset.defaultCharset());
+    documents.addAll(textReader2.get());
+
+    log.info("Splitting text into chunks");
+    var tokenizedDocuments = new TokenTextSplitter().apply(documents);
+
+    log.info("Creating and storing Embeddings from Documents");
+    vectorStore.add(tokenizedDocuments);
+}
+```
+
+The source files are classpath resources:
+- `documents/story1.md` — loaded with `tenant: dukes`
+- `documents/story2.txt` — loaded with `tenant: beans`
+
+<Warning>
+`DocumentInitializer` runs on every startup and re-inserts all documents. In production you would want to check whether documents already exist in Chroma before re-embedding them.
+</Warning>

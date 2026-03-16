@@ -1,0 +1,247 @@
+---
+title: "Schema-based data isolation"
+description: "Implementing per-tenant database schema isolation with Hibernate multi-tenancy and Flyway migrations."
+---
+
+## Strategy
+
+The Instrument Service uses a **schema-per-tenant** approach with PostgreSQL. Each tenant's data lives in its own schema (e.g., `DUKES`, `BEANS`). A `default` schema holds shared infrastructure tables (Flyway history, etc.).
+
+<CardGroup cols={2}>
+  <Card title="TenantContextHolder" icon="database">
+    Thread-local store for the current tenant identifier. Set by `TenantContextFilter` on every request.
+  </Card>
+  <Card title="TenantIdentifierResolver" icon="magnifying-glass">
+    Hibernate hook that reads from `TenantContextHolder` to determine the active schema.
+  </Card>
+  <Card title="ConnectionProvider" icon="plug">
+    Hibernate `MultiTenantConnectionProvider` that sets the PostgreSQL `search_path` to the tenant schema on each connection.
+  </Card>
+  <Card title="TenantFlywayMigrationInitializer" icon="arrow-up">
+    Runs Flyway migrations into each tenant schema at startup.
+  </Card>
+</CardGroup>
+
+---
+
+## TenantContextHolder
+
+`TenantContextHolder` is a utility class backed by a `ThreadLocal<String>`. It is the single source of truth for the current tenant within a request thread.
+
+```java TenantContextHolder.java
+public final class TenantContextHolder {
+
+    private static final ThreadLocal<String> tenantIdentifier = new ThreadLocal<>();
+
+    public static void setTenantIdentifier(String tenant) {
+        Assert.hasText(tenant, "tenant cannot be empty");
+        tenantIdentifier.set(tenant);
+    }
+
+    @Nullable
+    public static String getTenantIdentifier() {
+        return tenantIdentifier.get();
+    }
+
+    public static String getRequiredTenantIdentifier() {
+        var tenant = getTenantIdentifier();
+        if (!StringUtils.hasText(tenant)) {
+            throw new TenantNotFoundException("No tenant found in the current context");
+        }
+        return tenant;
+    }
+
+    public static void clear() {
+        tenantIdentifier.remove();
+    }
+
+}
+```
+
+`TenantContextFilter` sets the tenant on every inbound request (reading from the `X-TenantId` HTTP header) and clears it in a `finally` block after the filter chain completes.
+
+---
+
+## TenantIdentifierResolver
+
+`TenantIdentifierResolver` implements Hibernate's `CurrentTenantIdentifierResolver<String>` and `HibernatePropertiesCustomizer`, registering itself as the resolver via `AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER`.
+
+When Hibernate needs to open a session it calls `resolveCurrentTenantIdentifier()`. If no tenant is set (e.g., during startup), it falls back to `DEFAULT`:
+
+```java TenantIdentifierResolver.java
+@Component
+public class TenantIdentifierResolver implements CurrentTenantIdentifierResolver<String>, HibernatePropertiesCustomizer {
+
+    public static final String DEFAULT_TENANT = "DEFAULT";
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        return Objects.requireNonNullElse(TenantContextHolder.getTenantIdentifier(), DEFAULT_TENANT);
+    }
+
+    @Override
+    public boolean validateExistingCurrentSessions() {
+        return true;
+    }
+
+    @Override
+    public void customize(Map<String, Object> hibernateProperties) {
+        hibernateProperties.put(AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER, this);
+    }
+
+}
+```
+
+---
+
+## ConnectionProvider
+
+`ConnectionProvider` implements Hibernate's `MultiTenantConnectionProvider<String>`. For each tenant-specific connection request, it:
+
+1. Looks up the tenant's configured schema name via `TenantDetailsService`.
+2. Obtains a raw connection from the `DataSource`.
+3. Sets `connection.setSchema(schema)` so all queries run against the correct PostgreSQL schema.
+
+When a connection is released it resets the schema to `DEFAULT` before closing.
+
+```java ConnectionProvider.java
+@Component
+public class ConnectionProvider implements MultiTenantConnectionProvider<String>, HibernatePropertiesCustomizer {
+
+    private final DataSource dataSource;
+    private final TenantDetailsService tenantDetailsService;
+
+    @Override
+    public Connection getConnection(String tenantIdentifier) throws SQLException {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(tenantIdentifier);
+        var schema = tenantDetails != null ? tenantDetails.schema() : tenantIdentifier;
+
+        Connection connection = dataSource.getConnection();
+        connection.setSchema(schema);
+        return connection;
+    }
+
+    @Override
+    public void releaseConnection(String tenantIdentifier, Connection connection) throws SQLException {
+        connection.setSchema("DEFAULT");
+        connection.close();
+    }
+
+    @Override
+    public Connection getAnyConnection() throws SQLException {
+        return getConnection("DEFAULT");
+    }
+
+    @Override
+    public void customize(Map<String, Object> hibernateProperties) {
+        hibernateProperties.put(AvailableSettings.MULTI_TENANT_CONNECTION_PROVIDER, this);
+    }
+
+}
+```
+
+<Note>
+Both `TenantIdentifierResolver` and `ConnectionProvider` use `HibernatePropertiesCustomizer` to self-register, keeping Hibernate auto-configuration intact while transparently enabling multi-tenancy.
+</Note>
+
+---
+
+## TenantFlywayMigrationInitializer
+
+The default Flyway auto-configuration handles the `default` schema (shared tables). `TenantFlywayMigrationInitializer` runs **after** the default migration (order `1`) and applies per-tenant SQL scripts located at `db/migration/tenant` into each tenant's schema:
+
+```java TenantFlywayMigrationInitializer.java
+@Component
+public class TenantFlywayMigrationInitializer implements InitializingBean, Ordered {
+
+    private static final String TENANT_MIGRATION_LOCATION = "db/migration/tenant";
+
+    @Override
+    public void afterPropertiesSet() {
+        tenantDetailsService.loadAllTenants().forEach(tenant -> {
+            Flyway flyway = tenantFlyway(tenant.schema());
+            flyway.migrate();
+        });
+    }
+
+    private Flyway tenantFlyway(String schema) {
+        return Flyway.configure()
+                .configuration(defaultFlyway.getConfiguration())
+                .locations(TENANT_MIGRATION_LOCATION)
+                .dataSource(dataSource)
+                .schemas(schema)
+                .load();
+    }
+
+    @Override
+    public int getOrder() {
+        // Executed after the default schema initialization in FlywayMigrationInitializer.
+        return 1;
+    }
+
+}
+```
+
+The `application.yml` instructs Spring Boot's Flyway auto-configuration to manage the `default` schema:
+
+```yaml instrument-service/src/main/resources/application.yml
+spring:
+  flyway:
+    locations: classpath:db/migration/default
+    schemas: default
+
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Warning>
+Flyway migrations run for **all** configured tenants, including those with `enabled: false`. Schema provisioning is decoupled from runtime access control.
+</Warning>
+
+---
+
+## TenantKeyGenerator
+
+Spring's default cache key generator does not account for the current tenant. `TenantKeyGenerator` prefixes every cache key with the tenant identifier, preventing data from one tenant leaking into another tenant's cache entries.
+
+```java TenantKeyGenerator.java
+/**
+ * An implementation of {@link KeyGenerator} that generates cache keys combining the
+ * current tenant identifier with the given method and parameters.
+ */
+@Component
+public final class TenantKeyGenerator implements KeyGenerator {
+
+    @Override
+    public Object generate(Object target, Method method, Object... params) {
+        return SimpleKeyGenerator.generateKey(TenantContextHolder.getRequiredTenantIdentifier(), params);
+    }
+
+}
+```
+
+It is referenced by name in `@Cacheable` annotations:
+
+```java InstrumentController.java
+@GetMapping("{type}")
+@Cacheable(cacheNames = "instrumentTypes", keyGenerator = "tenantKeyGenerator")
+List<Instrument> getInstrumentByType(@PathVariable String type) {
+    return instrumentRepository.findByType(type);
+}
+```
+
+<Tip>
+Use `tenantKeyGenerator` on any `@Cacheable` method that returns tenant-specific data. Omitting it on a shared cache will cause tenants to see each other's cached results.
+</Tip>

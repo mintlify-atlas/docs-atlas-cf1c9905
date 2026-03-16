@@ -1,0 +1,164 @@
+---
+title: "FAQ"
+description: "Frequently asked questions about the Spring Boot Multitenancy samples."
+---
+
+<AccordionGroup>
+
+  <Accordion title="How do I add a new tenant?">
+    Adding a tenant requires changes in three places:
+
+    **1. Update `multitenancy.tenants` in each service's `application.yml`**
+
+    Add an entry to Edge Service, Instrument Service, and Chat Service:
+
+    ```yaml
+    # edge-service application.yml
+    multitenancy:
+      tenants:
+        - identifier: newband
+          enabled: true
+          client-id: edge-service
+          client-secret: rocking-secret
+          issuer: http://localhost:8080/realms/newband
+    ```
+
+    ```yaml
+    # instrument-service application.yml
+    multitenancy:
+      tenants:
+        - identifier: newband
+          enabled: true
+          schema: NEWBAND
+          issuer: http://localhost:8080/realms/newband
+    ```
+
+    **2. Create a Keycloak realm**
+
+    Add a new realm import file to `platform/keycloak/` following the same structure as the existing `dukes` and `beans` realm files. Keycloak will import it on next startup with the `--import-realm` flag.
+
+    **3. Database schema**
+
+    The `NEWBAND` PostgreSQL schema will be created automatically by Flyway migration scripts on the next startup of `instrument-service`. No manual SQL is required.
+  </Accordion>
+
+  <Accordion title="How do I disable a tenant?">
+    Set `enabled: false` in the tenant entry in each service's `application.yml`:
+
+    ```yaml
+    multitenancy:
+      tenants:
+        - identifier: trixie
+          enabled: false
+          schema: TRIXIE
+          issuer: http://localhost:8080/realms/trixie
+    ```
+
+    With `enabled: false`:
+    - `PropertiesTenantDetailsService.loadTenantByIdentifier()` filters out disabled tenants and returns `null`.
+    - `TenantContextFilter` receives `null` and throws a `TenantResolutionException`, rejecting the request.
+    - At the Edge Service, a disabled tenant also means its OAuth2 client registration is not active, so authentication will fail for that subdomain.
+
+    The `trixie` tenant is pre-configured as a disabled example in the sample project.
+  </Accordion>
+
+  <Accordion title="What happens if the X-TenantId header is missing?">
+    `HttpHeaderTenantResolver.resolveTenantIdentifier()` returns `null` when the header is absent. `TenantContextFilter` then throws a `TenantResolutionException`:
+
+    ```
+    TenantResolutionException: A valid tenant must be specified for requests to /instruments/...
+    ```
+
+    In normal operation this should not happen because the Edge Service's Spring Cloud Gateway route always injects `X-TenantId` via the `AddRequestHeader` filter before forwarding. If a request arrives at `instrument-service` without going through the gateway, the header will be missing and the request will be rejected.
+  </Accordion>
+
+  <Accordion title="How does schema isolation work in Hibernate?">
+    Instrument Service uses PostgreSQL schema-per-tenant isolation. The mechanism involves two components:
+
+    **`TenantIdentifierResolver`** implements Hibernate's `CurrentTenantIdentifierResolver`. On every database operation it calls `TenantContextHolder.getTenantIdentifier()` to retrieve the active tenant and returns that value (falling back to `DEFAULT` if none is set). It also registers itself with Hibernate via `HibernatePropertiesCustomizer`.
+
+    ```java
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        return Objects.requireNonNullElse(
+            TenantContextHolder.getTenantIdentifier(), DEFAULT_TENANT);
+    }
+    ```
+
+    Hibernate uses the resolved identifier (e.g., `DUKES`) to set the PostgreSQL `search_path` on the connection before executing queries. This ensures every SQL statement issued during a request reads from and writes to the correct tenant schema without any changes to the application's data access code.
+  </Accordion>
+
+  <Accordion title="Can I run the services without Docker?">
+    It depends on the service:
+
+    **Instrument Service** — uses Testcontainers with the `bootTestRun` Gradle task. Running `./gradlew :instrument-service:bootTestRun` starts a PostgreSQL container automatically. You do not need a local PostgreSQL installation.
+
+    **Chat Service** — uses Spring AI with Ollama. Ollama must be installed and running locally with the `llama2` model pulled (`ollama pull llama2`). There is no Testcontainers setup for Ollama.
+
+    **Full stack** — the `compose.yml` at the project root starts all infrastructure services (Keycloak, PostgreSQL, Grafana Alloy, Loki, Prometheus, Tempo, Grafana, Chroma) in Docker. Running the full observability stack requires Docker.
+  </Accordion>
+
+  <Accordion title="How do I access Grafana?">
+    Grafana is available at [http://localhost:3000](http://localhost:3000) after starting the Docker Compose stack.
+
+    - **Admin login:** username `user`, password `password`
+    - **Anonymous access:** enabled — viewers can browse dashboards without logging in (configured via `GF_AUTH_ANONYMOUS_ENABLED=true` and `GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer`)
+
+    Pre-provisioned datasources for Loki (logs), Prometheus (metrics), and Tempo (traces) are loaded automatically from `platform/grafana/datasources/`.
+  </Accordion>
+
+  <Accordion title="What is the Grafana Alloy service?">
+    Grafana Alloy (formerly Grafana Agent) is the telemetry collector in this project's observability stack. It:
+
+    - Listens on ports `4317` (OTLP gRPC) and `4318` (OTLP HTTP) to receive traces and metrics from all Spring Boot services.
+    - Routes **traces** to Grafana Tempo.
+    - Routes **metrics** to Prometheus via remote write.
+    - Collects **logs** from Docker containers and forwards them to Grafana Loki.
+    - Scrapes PostgreSQL metrics for infrastructure dashboards.
+
+    All three services point `management.otlp.tracing.endpoint` to `http://localhost:4318/v1/traces`, which is the Alloy OTLP HTTP receiver. Alloy's configuration lives in `platform/alloy/config.alloy`.
+  </Accordion>
+
+  <Accordion title="How does tenant-aware caching work?">
+    `TenantKeyGenerator` implements Spring's `KeyGenerator` interface. It prefixes every cache key with the current tenant identifier:
+
+    ```java
+    @Component
+    public final class TenantKeyGenerator implements KeyGenerator {
+
+        @Override
+        public Object generate(Object target, Method method, Object... params) {
+            return SimpleKeyGenerator.generateKey(
+                TenantContextHolder.getRequiredTenantIdentifier(), params);
+        }
+
+    }
+    ```
+
+    Without this, a cache entry created for tenant `dukes` could be returned for a request from tenant `beans` if the method parameters happen to be identical. By including the tenant identifier in the key, the cache is partitioned per tenant.
+
+    To use it, annotate a method with `@Cacheable(keyGenerator = "tenantKeyGenerator")`.
+  </Accordion>
+
+  <Accordion title="Are the tenants in the sample real applications?">
+    No. The tenants represent fictional rock bands used as demo data:
+
+    - **dukes** — a rock band with instruments managed in the `DUKES` PostgreSQL schema and a dedicated Keycloak realm.
+    - **beans** — another rock band with the `BEANS` schema and its own realm.
+    - **trixie** — a third band that is pre-configured but intentionally disabled (`enabled: false`) to demonstrate the disabled-tenant behavior.
+
+    Requests are routed via subdomain: `dukes.rock` for the Dukes band and `beans.rock` for the Beans band.
+  </Accordion>
+
+  <Accordion title="What Keycloak users are pre-configured?">
+    Two users are imported with the Keycloak realm export files in `platform/keycloak/`:
+
+    | Realm | Username | Password |
+    |---|---|---|
+    | `dukes` | `isabelle` | `password` |
+    | `beans` | `bjorn` | `password` |
+
+    Keycloak itself is accessible at [http://localhost:8080](http://localhost:8080) with admin credentials `user` / `password`.
+  </Accordion>
+
+</AccordionGroup>

@@ -1,0 +1,273 @@
+---
+title: "Services"
+description: "Detailed breakdown of each service in the Spring Boot Multitenancy system."
+---
+
+The system consists of three Spring Boot services. Each service has a distinct responsibility in the multitenancy architecture and implements its own slice of tenant isolation.
+
+## Edge Service
+
+The Edge Service is the single entry point to the system. It runs as a reactive Spring Cloud Gateway application and is responsible for resolving the tenant from the request subdomain, authenticating the user against the correct Keycloak realm, and forwarding requests downstream with tenant context attached.
+
+**Port:** `80`
+
+**Key dependencies:** Spring Cloud Gateway, Spring Boot OAuth2 Client, Spring WebFlux, Micrometer
+
+### Subdomain routing
+
+Routes are matched using the `Host={tenant}.rock` predicate combined with `Path=/instruments/**`. The `{tenant}` path variable is extracted by Spring Cloud Gateway and made available for use in filters.
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - SaveSession
+        - TokenRelay
+      routes:
+        - id: instrument-route
+          uri: http://localhost:8181
+          predicates:
+            - Host={tenant}.rock
+            - Path=/instruments/**
+          filters:
+            - AddRequestHeader=X-TenantId,{tenant}
+```
+
+### TenantGatewayFilterFactory
+
+`TenantGatewayFilterFactory` extends the built-in `AddRequestHeader` filter to also write the tenant identifier into the observability context. This ensures that metrics and traces emitted by the gateway are tagged with the correct `tenant.id`.
+
+```java
+@Component
+public class TenantGatewayFilterFactory extends AbstractNameValueGatewayFilterFactory {
+
+    @Override
+    public GatewayFilter apply(NameValueConfig config) {
+        return new GatewayFilter() {
+            @Override
+            public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+                String tenantId = ServerWebExchangeUtils.expand(exchange, config.getValue());
+                ServerHttpRequest request = addTenantToRequest(exchange, tenantId, config);
+                addTenantToObservation(tenantId, exchange);
+                return chain.filter(exchange.mutate().request(request).build());
+            }
+        };
+    }
+
+    private void addTenantToObservation(String tenantId, ServerWebExchange exchange) {
+        ServerHttpObservationFilter.findObservationContext(exchange).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+    }
+}
+```
+
+### TenantClientRegistrationRepository
+
+OAuth2 client registrations are created dynamically at runtime rather than being declared statically in configuration. When Spring Security needs a `ClientRegistration` for a given tenant identifier, `TenantClientRegistrationRepository` looks up the tenant's details and constructs a registration pointing at the correct Keycloak realm.
+
+```java
+@Component
+public class TenantClientRegistrationRepository implements ReactiveClientRegistrationRepository {
+
+    private static final Map<String, Mono<ClientRegistration>> clientRegistrations = new ConcurrentHashMap<>();
+
+    @Override
+    public Mono<ClientRegistration> findByRegistrationId(String registrationId) {
+        return clientRegistrations.computeIfAbsent(registrationId, this::buildClientRegistration);
+    }
+
+    private Mono<ClientRegistration> buildClientRegistration(String registrationId) {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(registrationId);
+        return Mono.just(ClientRegistrations.fromOidcIssuerLocation(tenantDetails.issuer())
+            .registrationId(registrationId)
+            .clientId(tenantDetails.clientId())
+            .clientSecret(tenantDetails.clientSecret())
+            .redirectUri("{baseUrl}/login/oauth2/code/" + registrationId)
+            .scope("openid")
+            .build());
+    }
+}
+```
+
+Registrations are cached in a `ConcurrentHashMap` so that OIDC discovery only runs once per tenant per application lifecycle.
+
+### Tenant configuration
+
+Tenant details are loaded from the `multitenancy.tenants` list via `TenantDetailsProperties`. Each entry maps to a `TenantDetails` record.
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Warning>
+  If a client registration is requested for an unknown or disabled tenant, `TenantClientRegistrationRepository` throws a `TenantResolutionException` and the request is rejected before authentication proceeds.
+</Warning>
+
+---
+
+## Instrument Service
+
+The Instrument Service is a standard Spring MVC REST API backed by PostgreSQL. It implements per-tenant data isolation using Hibernate's multi-tenancy schema support and per-tenant Flyway migrations.
+
+**Port:** `8181`
+
+**Key dependencies:** Spring Data JPA, Hibernate, Flyway, Spring Security OAuth2 Resource Server
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/instruments` | Returns all instruments for the current tenant |
+| `GET` | `/instruments/{type}` | Returns instruments matching the given type (cached) |
+| `POST` | `/instruments` | Creates a new instrument for the current tenant |
+
+```java
+@RestController
+@RequestMapping("instruments")
+public class InstrumentController {
+
+    @GetMapping
+    List<Instrument> getInstruments() {
+        return instrumentRepository.findAll();
+    }
+
+    @GetMapping("{type}")
+    @Cacheable(cacheNames = "instrumentTypes", keyGenerator = "tenantKeyGenerator")
+    List<Instrument> getInstrumentByType(@PathVariable String type) {
+        return instrumentRepository.findByType(type);
+    }
+
+    @PostMapping
+    Instrument addInstrument(@RequestBody Instrument instrument) {
+        return instrumentRepository.save(instrument);
+    }
+}
+```
+
+### Tenant context resolution
+
+`TenantContextFilter` runs on every non-actuator request. It delegates to `HttpHeaderTenantResolver` to read the `X-TenantId` header, validates the tenant, and stores it in `TenantContextHolder`.
+
+See [Tenant resolution](/architecture/tenant-resolution) for a full walkthrough of this mechanism.
+
+### Schema-based data isolation
+
+Hibernate's `TenantIdentifierResolver` reads the current tenant from `TenantContextHolder` and returns the corresponding schema name (e.g., `DUKES` or `BEANS`). All SQL is executed within that schema.
+
+### Per-tenant Flyway migrations
+
+`TenantFlywayMigrationInitializer` runs schema migrations for each configured tenant at application startup, using the schema name from `TenantDetails`. The default Flyway configuration handles the `default` schema.
+
+```yaml
+spring:
+  flyway:
+    locations: classpath:db/migration/default
+    schemas: default
+```
+
+### Tenant-aware cache
+
+The `@Cacheable` annotation on `getInstrumentByType` uses a custom `tenantKeyGenerator` bean that incorporates the current tenant identifier into the cache key. This prevents one tenant's cached data from being served to another tenant.
+
+### Tenant configuration
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+---
+
+## Chat Service
+
+The Chat Service provides an AI-powered document chat endpoint. It uses Spring AI to integrate with Ollama (running the Llama 2 model locally) for language model inference and Chroma for vector-based document retrieval.
+
+**Port:** `8282`
+
+**Key dependencies:** Spring AI (Ollama, Chroma), Spring Web
+
+### Endpoint
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/ai/doc/chat` | Sends a message and receives a response grounded in tenant documents |
+
+```java
+@RestController
+class DocumentChatController {
+
+    @PostMapping("/ai/doc/chat")
+    String chatWithDocument(@RequestBody String input) {
+        return documentChatService.chatWithDocument(input).getContent();
+    }
+}
+```
+
+### Tenant context resolution
+
+The Chat Service uses the same `TenantContextFilter` pattern as the Instrument Service. `HttpHeaderTenantResolver` reads `X-TenantId` from the request, and the identifier is stored in `TenantContextHolder` for the duration of the request thread.
+
+### Per-tenant document context
+
+When querying Chroma, the service scopes its vector search to a Chroma collection associated with the current tenant. This ensures that document context retrieved for a chat response belongs only to the active tenant.
+
+### AI model configuration
+
+```yaml
+spring:
+  ai:
+    ollama:
+      chat:
+        model: llama2
+      embedding:
+        model: llama2
+  threads:
+    virtual:
+      enabled: true
+```
+
+<Tip>
+  Virtual threads are enabled in the Chat Service (`spring.threads.virtual.enabled: true`) to improve throughput when handling blocking Ollama inference calls.
+</Tip>
+
+### Tenant configuration
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+    - identifier: beans
+      enabled: true
+    - identifier: trixie
+      enabled: false
+```

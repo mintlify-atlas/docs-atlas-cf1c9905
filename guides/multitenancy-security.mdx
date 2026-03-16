@@ -1,0 +1,241 @@
+---
+title: "Multitenancy security"
+description: "Implementing per-tenant OAuth2/OIDC authentication with Keycloak realms in Spring Boot."
+---
+
+## Overview
+
+Each tenant maps to a dedicated Keycloak realm. The three tenants in this project are **dukes**, **beans**, and **trixie**, each backed by the corresponding realm at `http://localhost:8080/realms/{tenant}`.
+
+Authentication is handled at two layers:
+
+<CardGroup cols={2}>
+  <Card title="Edge Service" icon="shield">
+    Handles OAuth2 login. Dynamically builds a `ClientRegistration` per tenant using `TenantClientRegistrationRepository`.
+  </Card>
+  <Card title="Instrument Service" icon="lock">
+    Acts as a resource server. Resolves the correct JWT issuer per tenant using `TenantAuthenticationManagerResolver`.
+  </Card>
+</CardGroup>
+
+---
+
+## Tenant configuration
+
+All tenant metadata is declared under `multitenancy.tenants` in each service's `application.yml`. The `enabled` flag controls whether a tenant is active.
+
+**Edge Service** (`edge-service/src/main/resources/application.yml`):
+
+```yaml edge-service/src/main/resources/application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+**Instrument Service** (`instrument-service/src/main/resources/application.yml`):
+
+```yaml instrument-service/src/main/resources/application.yml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+The `TenantDetails` record in the Edge Service captures the OIDC client credentials alongside the issuer:
+
+```java TenantDetails.java
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String clientId,
+        String clientSecret,
+        String issuer
+) {}
+```
+
+Tenant properties are loaded via `TenantDetailsProperties`, bound to the `multitenancy` prefix using `@ConfigurationProperties`. `PropertiesTenantDetailsService` implements `TenantDetailsService` and filters out disabled tenants when looking up by identifier:
+
+```java PropertiesTenantDetailsService.java
+@Override
+public TenantDetails loadTenantByIdentifier(String identifier) {
+    return tenantDetailsProperties.tenants().stream()
+            .filter(TenantDetails::enabled)
+            .filter(tenantDetails -> identifier.equals(tenantDetails.identifier()))
+            .findFirst().orElse(null);
+}
+```
+
+<Warning>
+Tenants with `enabled: false` are excluded from all lookups. Requests for disabled tenants are rejected with a `TenantResolutionException`.
+</Warning>
+
+---
+
+## Edge Service: OAuth2 login
+
+### TenantClientRegistrationRepository
+
+`TenantClientRegistrationRepository` implements `ReactiveClientRegistrationRepository`. When Spring Security needs a `ClientRegistration` for a given `registrationId` (which equals the tenant identifier), this class:
+
+<Steps>
+  <Step title="Look up tenant details">
+    Calls `TenantDetailsService.loadTenantByIdentifier(registrationId)` to fetch OIDC config. Returns an error if the tenant is not found or disabled.
+  </Step>
+  <Step title="Build the ClientRegistration">
+    Uses `ClientRegistrations.fromOidcIssuerLocation()` to auto-discover the OIDC provider endpoints from the issuer URL, then sets the `clientId`, `clientSecret`, redirect URI, and `openid` scope.
+  </Step>
+  <Step title="Cache the result">
+    Stores the `Mono<ClientRegistration>` in a `ConcurrentHashMap` keyed by registration ID so subsequent logins for the same tenant skip the OIDC discovery call.
+  </Step>
+</Steps>
+
+```java TenantClientRegistrationRepository.java
+@Component
+public class TenantClientRegistrationRepository implements ReactiveClientRegistrationRepository {
+
+    private static final Map<String,Mono<ClientRegistration>> clientRegistrations = new ConcurrentHashMap<>();
+
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantClientRegistrationRepository(TenantDetailsService tenantDetailsService) {
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public Mono<ClientRegistration> findByRegistrationId(String registrationId) {
+        return clientRegistrations.computeIfAbsent(registrationId, this::buildClientRegistration);
+    }
+
+    private Mono<ClientRegistration> buildClientRegistration(String registrationId) {
+        var tenantDetails = tenantDetailsService.loadTenantByIdentifier(registrationId);
+        if (tenantDetails == null) {
+            throw new TenantResolutionException("A valid tenant must be specified for authentication requests");
+        }
+        return Mono.just(ClientRegistrations.fromOidcIssuerLocation(tenantDetails.issuer())
+            .registrationId(registrationId)
+            .clientId(tenantDetails.clientId())
+            .clientSecret(tenantDetails.clientSecret())
+            .redirectUri("{baseUrl}/login/oauth2/code/" + registrationId)
+            .scope("openid")
+            .build());
+    }
+
+}
+```
+
+### SecurityConfig (Edge Service)
+
+`SecurityConfig` wires `TenantClientRegistrationRepository` into `oauth2Login`. A custom `TenantAuthenticationEntryPoint` handles unauthenticated requests by extracting the tenant from the request host and redirecting to the correct `/oauth2/authorization/{tenantId}` URL:
+
+```java SecurityConfig.java
+@Bean
+SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http,
+        TenantClientRegistrationRepository clientRegistrationRepository) {
+    return http
+        .authorizeExchange(exchange -> exchange
+            .pathMatchers("/actuator/**", "/tenant-login/**").permitAll()
+            .anyExchange().authenticated())
+        .oauth2Login(oauth2 -> oauth2
+            .clientRegistrationRepository(clientRegistrationRepository))
+        .exceptionHandling(exception ->
+            exception.authenticationEntryPoint(new TenantAuthenticationEntryPoint()))
+        .build();
+}
+```
+
+<Note>
+`TenantAuthenticationEntryPoint` reads the subdomain from the request host (e.g., `dukes.rock`) and redirects unauthenticated requests to `/oauth2/authorization/dukes`.
+</Note>
+
+---
+
+## Instrument Service: JWT resource server
+
+### TenantAuthenticationManagerResolver
+
+The Instrument Service is a JWT resource server. `TenantAuthenticationManagerResolver` implements `AuthenticationManagerResolver<HttpServletRequest>` and selects the correct JWT decoder for the current tenant:
+
+<Steps>
+  <Step title="Read the current tenant">
+    Calls `TenantContextHolder.getRequiredTenantIdentifier()` to get the tenant already set by `TenantContextFilter` earlier in the filter chain.
+  </Step>
+  <Step title="Resolve or build the AuthenticationManager">
+    Uses a `ConcurrentHashMap` to cache `AuthenticationManager` instances per tenant. On first access, fetches the issuer URI from `TenantDetailsService` and creates a `JwtAuthenticationProvider` backed by a decoder from that issuer.
+  </Step>
+</Steps>
+
+```java TenantAuthenticationManagerResolver.java
+@Component
+public class TenantAuthenticationManagerResolver implements AuthenticationManagerResolver<HttpServletRequest> {
+
+    private static final Map<String,AuthenticationManager> authenticationManagers = new ConcurrentHashMap<>();
+    private final TenantDetailsService tenantDetailsService;
+
+    public TenantAuthenticationManagerResolver(TenantDetailsService tenantDetailsService) {
+        this.tenantDetailsService = tenantDetailsService;
+    }
+
+    @Override
+    public AuthenticationManager resolve(HttpServletRequest request) {
+        var tenantId = TenantContextHolder.getRequiredTenantIdentifier();
+        return authenticationManagers.computeIfAbsent(tenantId, this::buildAuthenticationManager);
+    }
+
+    private AuthenticationManager buildAuthenticationManager(String tenantId) {
+        var issuerUri = tenantDetailsService.loadTenantByIdentifier(tenantId).issuer();
+        var jwtAuthenticationProvider = new JwtAuthenticationProvider(JwtDecoders.fromIssuerLocation(issuerUri));
+        return jwtAuthenticationProvider::authenticate;
+    }
+
+}
+```
+
+### SecurityConfig (Instrument Service)
+
+`TenantContextFilter` is inserted **before** `BearerTokenAuthenticationFilter` so the tenant is available when `TenantAuthenticationManagerResolver.resolve()` is called:
+
+```java SecurityConfig.java
+@Bean
+SecurityFilterChain securityFilterChain(
+        HttpSecurity http,
+        AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver,
+        TenantContextFilter tenantContextFilter
+) throws Exception {
+    return http
+        .authorizeHttpRequests(request -> request
+            .requestMatchers("/actuator/**").permitAll()
+            .anyRequest().authenticated())
+        .oauth2ResourceServer(oauth2 -> oauth2
+            .authenticationManagerResolver(authenticationManagerResolver))
+        .addFilterBefore(tenantContextFilter, BearerTokenAuthenticationFilter.class)
+        .build();
+}
+```
+
+<Tip>
+Because `TenantContextFilter` runs before bearer token validation, the tenant context is available to both JWT decoding (correct issuer selection) and downstream business logic (schema routing, cache key generation).
+</Tip>

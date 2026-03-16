@@ -1,0 +1,61 @@
+---
+title: "Introduction"
+description: "Sample applications demonstrating how to build multitenant Java/Spring Boot services with per-tenant authentication, schema-based data isolation, and full-stack observability."
+---
+
+## What is Spring Boot Multitenancy?
+
+Spring Boot Multitenancy is a set of reference applications that show you how to implement multitenancy patterns in Java using Spring Boot 3.2, Spring Cloud Gateway, Spring Security OAuth2, and Hibernate. The project demonstrates production-grade techniques for isolating tenants across authentication, data, caching, and observability layers.
+
+Two tenants are pre-configured — `dukes` and `beans` — each with their own Keycloak realm, database schema, and credentials.
+
+## Services
+
+The project is composed of three Spring Boot applications that work together:
+
+<CardGroup cols={3}>
+  <Card title="Edge Service" icon="shield-halved" href="/architecture/services#edge-service">
+    Spring Cloud Gateway with per-tenant OAuth2 client registration and subdomain-based tenant routing. Acts as the entry point for all tenant traffic.
+  </Card>
+  <Card title="Instrument Service" icon="database" href="/architecture/services#instrument-service">
+    REST API backed by PostgreSQL with schema-based tenant isolation. Each tenant's data lives in a dedicated database schema, managed by Flyway.
+  </Card>
+  <Card title="Chat Service" icon="comments" href="/architecture/services#chat-service">
+    AI-powered chat service using Spring AI with Ollama LLM and Chroma vector store. Tenant context is propagated via HTTP headers.
+  </Card>
+</CardGroup>
+
+## Key patterns
+
+<CardGroup cols={2}>
+  <Card title="Subdomain routing" icon="globe" href="/architecture/tenant-resolution">
+    Tenants are identified by DNS subdomains (`dukes.rock`, `beans.rock`). Spring Cloud Gateway resolves the tenant from the `Host` header and propagates it downstream.
+  </Card>
+  <Card title="Per-tenant authentication" icon="key" href="/guides/multitenancy-security">
+    Each tenant maps to a Keycloak realm. The Edge Service dynamically registers OAuth2 clients per tenant. The Instrument Service resolves the correct JWT issuer at runtime.
+  </Card>
+  <Card title="Schema-based data isolation" icon="layer-group" href="/guides/data-isolation">
+    Hibernate's `CurrentTenantIdentifierResolver` routes JPA queries to the correct schema. Flyway runs per-tenant schema migrations automatically on startup.
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/guides/observability">
+    Distributed tracing with OpenTelemetry, metrics with Micrometer and Prometheus, and log aggregation with Loki — all tagged with tenant identifiers.
+  </Card>
+</CardGroup>
+
+## Technology stack
+
+| Layer | Technology |
+|---|---|
+| Language & Runtime | Java 21 |
+| Framework | Spring Boot 3.2 |
+| API Gateway | Spring Cloud Gateway |
+| Security | Spring Security OAuth2, Keycloak 24 |
+| Data | Spring Data JPA, Hibernate, PostgreSQL, Flyway |
+| AI | Spring AI, Ollama (Llama2), Chroma |
+| Observability | Micrometer, OpenTelemetry, Grafana, Loki, Tempo, Prometheus |
+| Testing | Testcontainers, JUnit 5 |
+| Build | Gradle |
+
+## License
+
+This project is licensed under the [Apache-2.0 License](https://github.com/ThomasVitale/spring-boot-multitenancy/blob/main/LICENSE).

@@ -1,0 +1,225 @@
+---
+title: "Configuration reference"
+description: "Complete reference for all multitenancy configuration properties across Edge Service, Instrument Service, and Chat Service."
+---
+
+Each service in the Spring Boot Multitenancy project declares its tenant roster and observability settings in `application.yml`. This page documents every property and shows the full configuration blocks from each service.
+
+## Edge Service
+
+The Edge Service acts as the API gateway. It handles OAuth2 login, session management, and routes requests downstream. Tenant configuration supplies the OAuth2 client credentials and Keycloak issuer URL for each tenant realm.
+
+### `multitenancy.tenants[]`
+
+<ParamField path="multitenancy.tenants[].identifier" type="string" required>
+  Unique tenant identifier used throughout the system. Must match the subdomain used in the gateway `Host` predicate (e.g., `dukes` matches `dukes.rock`) and the value injected in the `X-TenantId` header.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].enabled" type="boolean" required>
+  Whether the tenant is active. When set to `false`, the tenant entry exists in configuration but is treated as inactive — any request for this tenant results in a `TenantNotFoundException`.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].client-id" type="string" required>
+  OAuth2 client ID registered in the tenant's Keycloak realm. The Edge Service uses this when performing the authorization code flow on behalf of the tenant.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].client-secret" type="string" required>
+  OAuth2 client secret corresponding to the `client-id`. Should be stored securely (e.g., via Spring Cloud Config or Kubernetes Secrets) in production.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].issuer" type="string" required>
+  Keycloak realm issuer URL used for token validation and OIDC discovery. Must match the realm configured in Keycloak (e.g., `http://localhost:8080/realms/dukes`).
+</ParamField>
+
+### Full configuration block
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Warning>
+  The `trixie` tenant is present in configuration but has `enabled: false`. Requests from a `trixie.rock` subdomain are rejected with a `TenantNotFoundException` at the Edge Service.
+</Warning>
+
+### Spring Cloud Gateway routes
+
+The Edge Service uses Spring Cloud Gateway to route tenant traffic to downstream services. The route configuration uses a `Host` predicate to match by subdomain and an `AddRequestHeader` filter to propagate tenant identity.
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - SaveSession
+        - TokenRelay
+      routes:
+        - id: instrument-route
+          uri: http://localhost:8181
+          predicates:
+            - Host={tenant}.rock
+            - Path=/instruments/**
+          filters:
+            - AddRequestHeader=X-TenantId,{tenant}
+```
+
+| Component | Value | Description |
+|---|---|---|
+| `Host={tenant}.rock` predicate | e.g., `dukes.rock` | Matches incoming requests by subdomain. The `{tenant}` segment is captured as a URI template variable. |
+| `AddRequestHeader=X-TenantId,{tenant}` filter | e.g., `X-TenantId: dukes` | Injects the resolved tenant identifier as a request header before forwarding to the downstream service. |
+| `SaveSession` filter | — | Persists the session before forwarding, required for Spring Session integration. |
+| `TokenRelay` filter | — | Forwards the access token from the session to the downstream service. |
+
+---
+
+## Instrument Service
+
+The Instrument Service stores instrument data in a PostgreSQL database using schema-per-tenant isolation. Tenant configuration maps each tenant to a dedicated PostgreSQL schema and a Keycloak issuer for JWT validation.
+
+### `multitenancy.tenants[]`
+
+<ParamField path="multitenancy.tenants[].identifier" type="string" required>
+  Unique tenant identifier. Must match the value sent in the `X-TenantId` request header from the Edge Service.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].enabled" type="boolean" required>
+  Whether the tenant is active. Disabled tenants are excluded by `PropertiesTenantDetailsService.loadTenantByIdentifier()`, causing the `TenantContextFilter` to throw a `TenantResolutionException`.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].schema" type="string" required>
+  PostgreSQL schema name for this tenant's data. Convention in this project is uppercase (e.g., `DUKES`, `BEANS`). The `TenantIdentifierResolver` passes this value to Hibernate's `CurrentTenantIdentifierResolver`, which sets the PostgreSQL `search_path` per connection.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].issuer" type="string" required>
+  Keycloak realm issuer URL used to validate JWT tokens on incoming requests. The service uses this to confirm a token was issued by the correct realm for the given tenant.
+</ParamField>
+
+### Full configuration block
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      schema: DUKES
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      schema: BEANS
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false
+      schema: TRIXIE
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Note>
+  Flyway runs migrations against the `default` schema on startup. Tenant schemas (`DUKES`, `BEANS`, etc.) are created and populated by Flyway migration scripts on first boot. No manual schema setup is required.
+</Note>
+
+---
+
+## Chat Service
+
+The Chat Service uses Spring AI with Ollama. Its tenant configuration is minimal — it only tracks whether each tenant is enabled, with no schema or OAuth2 fields.
+
+### `multitenancy.tenants[]`
+
+<ParamField path="multitenancy.tenants[].identifier" type="string" required>
+  Unique tenant identifier.
+</ParamField>
+
+<ParamField path="multitenancy.tenants[].enabled" type="boolean" required>
+  Whether the tenant is active.
+</ParamField>
+
+### Full configuration block
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+    - identifier: beans
+      enabled: true
+    - identifier: trixie
+      enabled: false
+```
+
+---
+
+## Observability properties
+
+All three services share the same observability configuration block. These properties control distributed tracing, metrics export, and log correlation.
+
+<ParamField path="management.otlp.tracing.endpoint" type="string" default="http://localhost:4318/v1/traces">
+  OTLP HTTP endpoint where traces are sent. In the Docker Compose setup, this points to Grafana Alloy, which routes traces to Grafana Tempo.
+</ParamField>
+
+<ParamField path="management.tracing.sampling.probability" type="number" default="1.0">
+  Fraction of requests to trace. `1.0` means 100% sampling, appropriate for development. Reduce this in high-traffic production environments.
+</ParamField>
+
+<ParamField path="management.prometheus.metrics.export.step" type="string" default="5s">
+  How frequently metrics are aggregated and made available for Prometheus scraping. The `5s` default gives near-real-time visibility in Grafana dashboards.
+</ParamField>
+
+<ParamField path="logging.pattern.correlation" type="string">
+  Logback pattern prepended to each log line. Includes `traceId`, `spanId`, and `tenantId` from the MDC, enabling correlated log queries in Grafana Loki.
+
+  ```
+  [%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}]
+  ```
+</ParamField>
+
+### Full observability block (same across all services)
+
+```yaml
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+
+management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      show-components: always
+```

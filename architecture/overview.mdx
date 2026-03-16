@@ -1,0 +1,109 @@
+---
+title: "Architecture overview"
+description: "High-level view of the multitenant system: services, data flow, and tenant isolation boundaries."
+---
+
+Spring Boot Multitenancy is a three-service system where every request is scoped to a tenant from the moment it arrives at the network edge. Tenant identity flows through the stack as an HTTP header and is used to select the right authentication realm, database schema, AI document collection, and observability tags.
+
+## Services and backing infrastructure
+
+<CardGroup cols={2}>
+  <Card title="Edge Service" icon="shield">
+    API gateway running on port 80. Resolves the tenant from the request subdomain, authenticates the user against the correct Keycloak realm, and forwards requests to upstream services with an `X-TenantId` header.
+  </Card>
+  <Card title="Instrument Service" icon="database">
+    REST API running on port 8181, backed by PostgreSQL. Reads `X-TenantId` from the incoming request and routes all database operations to the corresponding PostgreSQL schema.
+  </Card>
+  <Card title="Chat Service" icon="message-circle">
+    AI chat service running on port 8282, powered by Ollama (Llama 2) and Chroma. Reads `X-TenantId` to scope document retrieval to the tenant's Chroma collection.
+  </Card>
+  <Card title="Keycloak" icon="key">
+    Identity provider running on port 8080. Each tenant maps to its own realm (e.g., `dukes`, `beans`), providing complete authentication isolation.
+  </Card>
+  <Card title="PostgreSQL" icon="layers">
+    Relational database shared across tenants but isolated by schema. Each tenant's data lives in a dedicated schema (`DUKES`, `BEANS`, etc.), managed by per-tenant Flyway migrations.
+  </Card>
+  <Card title="Chroma" icon="cpu">
+    Vector database running on port 8000. Stores document embeddings per tenant, allowing the Chat Service to retrieve context relevant only to the active tenant.
+  </Card>
+  <Card title="Observability stack" icon="bar-chart">
+    Grafana (port 3000), Loki, Prometheus, Tempo, and Grafana Alloy. All services emit traces, metrics, and logs tagged with the `tenant.id` attribute, enabling per-tenant observability.
+  </Card>
+</CardGroup>
+
+## Request flow
+
+The following walkthrough traces a browser request for `http://dukes.rock/instruments/` through the entire system.
+
+<Steps>
+  <Step title="DNS resolution">
+    The browser resolves `dukes.rock` to `127.0.0.1` (configured in `/etc/hosts`). The subdomain `dukes` encodes the tenant identity before the request even reaches the application.
+  </Step>
+  <Step title="Edge Service: subdomain routing">
+    Spring Cloud Gateway matches the request using the `Host={tenant}.rock` predicate and the `Path=/instruments/**` predicate. The route variable `{tenant}` is captured as `dukes`.
+
+    ```yaml
+    routes:
+      - id: instrument-route
+        uri: http://localhost:8181
+        predicates:
+          - Host={tenant}.rock
+          - Path=/instruments/**
+        filters:
+          - AddRequestHeader=X-TenantId,{tenant}
+    ```
+  </Step>
+  <Step title="Edge Service: authentication">
+    `TenantClientRegistrationRepository` looks up the OAuth2 client configuration for the `dukes` tenant and initiates an OIDC login flow against `http://localhost:8080/realms/dukes`. The user is redirected to Keycloak's `dukes` realm login page.
+  </Step>
+  <Step title="Edge Service: tenant header injection">
+    After authentication, `TenantGatewayFilterFactory` adds `X-TenantId: dukes` to the outgoing request and records `tenant.id=dukes` in the observability context. The `TokenRelay` filter forwards the OAuth2 access token to the upstream service.
+  </Step>
+  <Step title="Instrument Service: tenant context establishment">
+    `TenantContextFilter` reads the `X-TenantId` header, validates the tenant against `TenantDetailsService`, and stores the identifier in `TenantContextHolder` (a `ThreadLocal`). It also tags the MDC and trace context with `tenantId=dukes`.
+  </Step>
+  <Step title="Instrument Service: schema-scoped data access">
+    Hibernate's `TenantIdentifierResolver` reads the current tenant from `TenantContextHolder` and routes all JPA queries to the `DUKES` schema. The response contains only data belonging to the `dukes` tenant.
+  </Step>
+  <Step title="Cleanup">
+    After the response is returned, `TenantContextFilter` clears `TenantContextHolder` and removes `tenantId` from the MDC to prevent context leakage across requests.
+  </Step>
+</Steps>
+
+## Tenant isolation layers
+
+| Layer | Mechanism | Scope |
+|---|---|---|
+| Authentication | Separate Keycloak realm per tenant | Edge Service |
+| Transport | `X-TenantId` HTTP header | Edge → upstream services |
+| Data | PostgreSQL schema per tenant | Instrument Service |
+| AI context | Chroma collection per tenant | Chat Service |
+| Observability | `tenant.id` tag on metrics, traces, and logs | All services |
+
+## Tenant configuration
+
+Each tenant is declared statically in `application.yml`. A tenant with `enabled: false` is rejected at the filter layer and will cause a `TenantNotFoundException`.
+
+```yaml
+multitenancy:
+  tenants:
+    - identifier: dukes
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/dukes
+    - identifier: beans
+      enabled: true
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/beans
+    - identifier: trixie
+      enabled: false   # requests for this tenant are rejected
+      client-id: edge-service
+      client-secret: rocking-secret
+      issuer: http://localhost:8080/realms/trixie
+```
+
+<Note>
+  Two tenants are active by default: `dukes` and `beans`. The `trixie` tenant is declared but disabled, demonstrating how to deactivate a tenant without removing its configuration.
+</Note>

@@ -1,80 +1,160 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Run the Spring Boot Multitenancy sample applications locally in minutes."
 ---
 
-## Get started in three steps
+This guide walks you through cloning and running all three services — Edge Service, Instrument Service, and Chat Service — on your local machine with two fully isolated tenants.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, make sure you have the following installed:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- **Java 21** — all three services use the Java 21 toolchain
+- **Docker** and **Docker Compose** — required to run Keycloak, PostgreSQL, and the observability stack
+- **Gradle** (or use the included `./gradlew` wrapper) — used to build and run each service
+- **Ollama** _(optional)_ — only required if you want to run Chat Service without Testcontainers; install from [ollama.ai](https://ollama.ai)
 
-### Step 2: Deploy your changes
+---
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## Get up and running
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+<Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+<Step title="Clone the repository">
 
-### Step 3: Go live
+Clone the project from GitHub and navigate into it:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash
+git clone https://github.com/ThomasVitale/spring-boot-multitenancy.git
+cd spring-boot-multitenancy
+```
 
-## Next steps
+</Step>
 
-Now that you have your docs running, explore these key features:
+<Step title="Configure tenant DNS">
 
-<CardGroup cols={2}>
+The two tenants — `dukes` and `beans` — are resolved by hostname. Add the following entries to your `/etc/hosts` file so that `dukes.rock` and `beans.rock` resolve to localhost:
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+```bash
+127.0.0.1       dukes.rock
+127.0.0.1       beans.rock
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+On macOS and Linux, `/etc/hosts` requires `sudo` to edit. On Windows, the equivalent file is `C:\Windows\System32\drivers\etc\hosts`.
 </Note>
+
+</Step>
+
+<Step title="Start backing services with Docker Compose">
+
+From the project root, start all infrastructure services in detached mode:
+
+```bash
+docker-compose up -d
+```
+
+This starts the following containers:
+
+| Service | Purpose | Port |
+|---|---|---|
+| **Keycloak** | Authentication and tenant realm management | `8080` |
+| **PostgreSQL** | Grafana metadata database | — |
+| **Chroma** | Vector database for Chat Service | `8000` |
+| **Grafana** | Observability dashboards | `3000` |
+| **Loki** | Log aggregation | `3100` |
+| **Tempo** | Distributed tracing | `4317`, `4318` |
+| **Prometheus** | Metrics collection | — |
+| **Alloy** | Grafana telemetry collector (OTLP receiver) | `4317`, `4318`, `12345` |
+
+<Tip>
+Once running, you can access Grafana at [http://localhost:3000](http://localhost:3000) using `user` / `password`.
+</Tip>
+
+</Step>
+
+<Step title="Run Instrument Service">
+
+Instrument Service (port `8181`) uses Spring Data JPA with Flyway migrations and a multi-schema PostgreSQL setup — one schema per tenant (`DUKES` and `BEANS`). Use `bootTestRun` to let Testcontainers automatically provision a PostgreSQL instance:
+
+```bash
+./gradlew :instrument-service:bootTestRun
+```
+
+<Note>
+`bootTestRun` relies on Testcontainers to spin up a dedicated PostgreSQL container, so you do not need a separately configured database connection for this service.
+</Note>
+
+</Step>
+
+<Step title="Run Edge Service">
+
+Edge Service (port `80`) acts as the API gateway. It routes requests to Instrument Service based on the `Host` header (e.g. `dukes.rock` → tenant `dukes`) and relays OAuth2 tokens via the `TokenRelay` filter. Two tenants are active: `dukes` and `beans`, each backed by a separate Keycloak realm.
+
+```bash
+./gradlew :edge-service:bootRun
+```
+
+</Step>
+
+<Step title="Run Chat Service">
+
+Chat Service (port `8282`) uses Spring AI with Ollama (llama2 model) and Chroma for vector storage. You have two options:
+
+**Option A — Testcontainers (recommended for local dev):**
+
+```bash
+./gradlew :chat-service:bootTestRun
+```
+
+**Option B — Local Ollama:**
+
+If you have Ollama installed and prefer to run the model directly, pull and start the llama2 model first:
+
+```bash
+ollama run llama2
+```
+
+Then start Chat Service normally:
+
+```bash
+./gradlew :chat-service:bootRun
+```
+
+<Note>
+Chat Service uses `llama2` for both chat completions and embeddings, as configured in `chat-service/src/main/resources/application.yml`.
+</Note>
+
+</Step>
+
+<Step title="Test the two tenants">
+
+With all three services running, open your browser and verify each tenant sees its own isolated data.
+
+**Tenant: dukes**
+
+1. Navigate to [http://dukes.rock/instruments/](http://dukes.rock/instruments/)
+2. You are redirected to Keycloak for the `dukes` realm
+3. Log in with `isabelle` / `password`
+4. You should see the list of instruments belonging to the Dukes rock band
+
+**Tenant: beans**
+
+1. Open a second browser window (or a private/incognito window) and navigate to [http://beans.rock/instruments/](http://beans.rock/instruments/)
+2. You are redirected to Keycloak for the `beans` realm
+3. Log in with `bjorn` / `password`
+4. You should see the list of instruments belonging to the Beans rock band
+
+<Tip>
+Use separate browser profiles or incognito windows to hold sessions for both tenants simultaneously without conflicts.
+</Tip>
+
+</Step>
+
+</Steps>
+
+## How tenant isolation works
+
+The Edge Service reads the subdomain from the `Host` header using the route predicate `Host={tenant}.rock` and injects it as the `X-TenantId` request header downstream. Each tenant maps to its own Keycloak realm for authentication and its own PostgreSQL schema in Instrument Service — `DUKES` and `BEANS` — ensuring complete data isolation between tenants.
+
+A third tenant, `trixie`, is defined in the configuration but set to `enabled: false`, demonstrating how tenants can be toggled without code changes.

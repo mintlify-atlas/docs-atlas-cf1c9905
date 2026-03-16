@@ -1,0 +1,305 @@
+---
+title: "Tenant context API"
+description: "Reference for the tenant context and resolution classes used across all services."
+---
+
+This page documents every class and interface involved in establishing, propagating, and consuming tenant context at runtime. These components form a lightweight multitenancy framework implemented directly in each service.
+
+## TenantContextHolder
+
+`TenantContextHolder` is a thread-local store that holds the identifier of the tenant currently being served. It is the single source of truth for tenant identity during a request.
+
+```java
+public final class TenantContextHolder {
+
+    private static final ThreadLocal<String> tenantIdentifier = new ThreadLocal<>();
+
+    private TenantContextHolder() {}
+
+    public static void setTenantIdentifier(String tenant) {
+        Assert.hasText(tenant, "tenant cannot be empty");
+        tenantIdentifier.set(tenant);
+    }
+
+    @Nullable
+    public static String getTenantIdentifier() {
+        return tenantIdentifier.get();
+    }
+
+    public static String getRequiredTenantIdentifier() {
+        var tenant = getTenantIdentifier();
+        if (!StringUtils.hasText(tenant)) {
+            throw new TenantNotFoundException("No tenant found in the current context");
+        }
+        return tenant;
+    }
+
+    public static void clear() {
+        tenantIdentifier.remove();
+    }
+
+}
+```
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `setTenantIdentifier(String tenant)` | `void` | Sets the current tenant on the thread-local. Throws `IllegalArgumentException` if the value is null or blank. |
+| `getTenantIdentifier()` | `String` (nullable) | Returns the current tenant identifier, or `null` if none is set. |
+| `getRequiredTenantIdentifier()` | `String` | Returns the current tenant identifier. Throws `TenantNotFoundException` if none is set. |
+| `clear()` | `void` | Removes the tenant from the `ThreadLocal`. Must be called at the end of every request to prevent thread-pool leaks. |
+
+<Warning>
+  Always call `TenantContextHolder.clear()` in a `finally` block after request processing. Thread pools reuse threads across requests — a stale tenant identifier left in the `ThreadLocal` will corrupt subsequent requests served by the same thread.
+</Warning>
+
+---
+
+## TenantDetails
+
+`TenantDetails` is a Java record that carries core information about a tenant. Each service defines its own variant because the fields required differ by service.
+
+### Edge Service variant
+
+Holds the OAuth2 credentials needed to configure a per-tenant Spring Security client registration.
+
+```java
+// com.thomasvitale.edgeservice.multitenancy.tenantdetails
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String clientId,
+        String clientSecret,
+        String issuer
+) {}
+```
+
+### Instrument Service variant
+
+Holds the PostgreSQL schema name and Keycloak issuer needed for data isolation and JWT validation.
+
+```java
+// com.thomasvitale.instrumentservice.multitenancy.tenantdetails
+public record TenantDetails(
+        String identifier,
+        boolean enabled,
+        String schema,
+        String issuer
+) {}
+```
+
+### Chat Service variant
+
+Minimal variant — only tracks whether the tenant is enabled.
+
+```java
+// com.thomasvitale.chatservice.multitenancy.tenantdetails
+public record TenantDetails(
+        String identifier,
+        boolean enabled
+) {}
+```
+
+<Note>
+  All three variants share `identifier` and `enabled`. Extra fields (`clientId`, `clientSecret`, `schema`, `issuer`) are only present in the services that require them.
+</Note>
+
+---
+
+## TenantDetailsService
+
+`TenantDetailsService` is the core interface for loading tenant data. It acts as a tenant DAO, decoupling the rest of the framework from any particular storage mechanism.
+
+```java
+public interface TenantDetailsService {
+
+    List<TenantDetails> loadAllTenants();
+
+    @Nullable
+    TenantDetails loadTenantByIdentifier(String identifier);
+
+}
+```
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `loadAllTenants()` | `List<TenantDetails>` | Returns all registered tenants, regardless of their `enabled` state. |
+| `loadTenantByIdentifier(String identifier)` | `TenantDetails` (nullable) | Returns the tenant matching the given identifier, or `null` if not found. Only returns enabled tenants in the default implementation. |
+
+### PropertiesTenantDetailsService
+
+The default implementation reads tenant data from `multitenancy.tenants` in `application.yml` via the `TenantDetailsProperties` configuration properties class.
+
+```java
+@Service
+public class PropertiesTenantDetailsService implements TenantDetailsService {
+
+    private final TenantDetailsProperties tenantDetailsProperties;
+
+    public PropertiesTenantDetailsService(TenantDetailsProperties tenantDetailsProperties) {
+        this.tenantDetailsProperties = tenantDetailsProperties;
+    }
+
+    @Override
+    public List<TenantDetails> loadAllTenants() {
+        return tenantDetailsProperties.tenants();
+    }
+
+    @Override
+    public TenantDetails loadTenantByIdentifier(String identifier) {
+        return tenantDetailsProperties.tenants().stream()
+                .filter(TenantDetails::enabled)
+                .filter(tenantDetails -> identifier.equals(tenantDetails.identifier()))
+                .findFirst().orElse(null);
+    }
+
+}
+```
+
+<Tip>
+  `loadTenantByIdentifier` filters by `enabled` before matching. Disabled tenants return `null`, which the calling code (e.g., `TenantContextFilter`) treats as an unresolvable tenant.
+</Tip>
+
+---
+
+## TenantResolver / HttpHeaderTenantResolver
+
+`TenantResolver<T>` is a functional interface that extracts a tenant identifier from a given source object of type `T`.
+
+```java
+@FunctionalInterface
+public interface TenantResolver<T> {
+
+    /**
+     * Resolves a tenant identifier from the given source.
+     */
+    @Nullable
+    String resolveTenantIdentifier(T source);
+
+}
+```
+
+`HttpHeaderTenantResolver` is the built-in implementation that reads the `X-TenantId` HTTP header from an `HttpServletRequest`.
+
+```java
+@Component
+public class HttpHeaderTenantResolver implements TenantResolver<HttpServletRequest> {
+
+    private static final String TENANT_HEADER = "X-TenantId";
+
+    @Override
+    @Nullable
+    public String resolveTenantIdentifier(HttpServletRequest request) {
+        return request.getHeader(TENANT_HEADER);
+    }
+
+}
+```
+
+The `X-TenantId` header is set by the Edge Service's Spring Cloud Gateway `AddRequestHeader` filter before the request reaches the downstream service.
+
+---
+
+## TenantContextFilter
+
+`TenantContextFilter` is a Servlet filter (extending `OncePerRequestFilter`) that ties everything together for each incoming HTTP request.
+
+```java
+@Component
+public class TenantContextFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+        var tenantIdentifier = httpRequestTenantResolver.resolveTenantIdentifier(request);
+
+        if (StringUtils.hasText(tenantIdentifier) && isTenantValid(tenantIdentifier)) {
+            TenantContextHolder.setTenantIdentifier(tenantIdentifier);
+            configureLogs(tenantIdentifier);
+            configureTraces(tenantIdentifier, request);
+        } else {
+            throw new TenantResolutionException(
+                "A valid tenant must be specified for requests to %s".formatted(request.getRequestURI()));
+        }
+
+        try {
+            filterChain.doFilter(request, response);
+        } finally {
+            clear();
+        }
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return request.getRequestURI().startsWith("/actuator");
+    }
+
+    private void clear() {
+        MDC.remove("tenantId");
+        TenantContextHolder.clear();
+    }
+
+}
+```
+
+### Lifecycle per request
+
+1. `HttpHeaderTenantResolver` reads the `X-TenantId` header.
+2. `TenantDetailsService.loadTenantByIdentifier()` validates the tenant exists and is enabled.
+3. If valid: `TenantContextHolder.setTenantIdentifier()` is called, `tenantId` is added to the MDC for log correlation, and a high-cardinality trace tag `tenant.id` is added.
+4. If invalid or missing: `TenantResolutionException` is thrown immediately.
+5. The filter chain continues with tenant context established.
+6. In the `finally` block: MDC is cleared and `TenantContextHolder.clear()` is called unconditionally.
+
+<Note>
+  Actuator endpoints (`/actuator/**`) are excluded via `shouldNotFilter()` — they do not require a tenant context.
+</Note>
+
+---
+
+## Exceptions
+
+### TenantNotFoundException
+
+Thrown when tenant identity is needed but cannot be found.
+
+```java
+public class TenantNotFoundException extends IllegalStateException {
+
+    public TenantNotFoundException() {
+        super("No tenant found in the current context");
+    }
+
+    public TenantNotFoundException(String message) {
+        super(message);
+    }
+
+}
+```
+
+Raised in two scenarios:
+- `TenantContextHolder.getRequiredTenantIdentifier()` is called when no tenant is set on the current thread.
+- A tenant identifier is present but `PropertiesTenantDetailsService` cannot find a matching enabled tenant (resulting in a `null` from `loadTenantByIdentifier`, which the filter then rejects).
+
+### TenantResolutionException
+
+Thrown during the resolution phase when a valid tenant cannot be determined from the request.
+
+```java
+public class TenantResolutionException extends IllegalStateException {
+
+    public TenantResolutionException() {
+        super("Error when trying to resolve the current tenant");
+    }
+
+    public TenantResolutionException(String message) {
+        super(message);
+    }
+
+}
+```
+
+Raised by `TenantContextFilter` when the `X-TenantId` header is absent, blank, or contains an identifier that does not match any enabled tenant in configuration.

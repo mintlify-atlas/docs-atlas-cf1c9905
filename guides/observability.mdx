@@ -1,0 +1,226 @@
+---
+title: "Observability"
+description: "Distributed tracing, metrics, and log aggregation with Micrometer, OpenTelemetry, and the Grafana stack."
+---
+
+## Stack overview
+
+<CardGroup cols={2}>
+  <Card title="Grafana Alloy" icon="server">
+    The OpenTelemetry-compatible collector that receives traces via OTLP, scrapes Prometheus metrics, and tails Docker container logs for Loki.
+  </Card>
+  <Card title="Grafana Tempo" icon="route">
+    Distributed trace storage. Receives OTLP traces forwarded by Alloy.
+  </Card>
+  <Card title="Prometheus" icon="chart-bar">
+    Time-series metrics storage. Metrics are pushed by Alloy via remote-write.
+  </Card>
+  <Card title="Grafana Loki" icon="scroll">
+    Log aggregation. Alloy discovers Docker containers and ships their logs.
+  </Card>
+</CardGroup>
+
+All four backends are visualised in **Grafana**, available at [http://localhost:3000](http://localhost:3000). Anonymous viewer access is enabled so no login is required in development.
+
+---
+
+## Docker Compose services
+
+The full observability platform is declared in `compose.yml`. The key services:
+
+```yaml compose.yml
+services:
+  grafana:
+    image: docker.io/grafana/grafana-oss:10.4.2
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+
+  loki:
+    image: docker.io/grafana/loki:2.9.7
+    ports:
+      - "3100:3100"
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v2.51.2
+    command:
+      - "--enable-feature=otlp-write-receiver"
+      - "--enable-feature=exemplar-storage"
+      - "--web.enable-remote-write-receiver"
+
+  tempo:
+    image: docker.io/grafana/tempo:2.4.1
+    ports:
+      - "4317"   # OTLP gRPC
+      - "4318"   # OTLP HTTP
+
+  alloy:
+    image: docker.io/grafana/alloy:v1.0.0
+    ports:
+      - "4317:4317"   # OTLP gRPC (applications send traces here)
+      - "4318:4318"   # OTLP HTTP
+      - "12345:12345" # Alloy UI
+    volumes:
+      - ./platform/alloy/config.alloy:/etc/alloy/config.alloy
+```
+
+Alloy is the single entry point for all telemetry. It is configured via `platform/alloy/config.alloy`.
+
+---
+
+## Tenant tagging
+
+Tenant identity is propagated into both logs and traces so you can filter observability data by tenant in Grafana.
+
+### Logs
+
+All three services (`edge-service`, `instrument-service`, `chat-service`) use the same log correlation pattern, which injects the `tenantId` MDC key into every log line:
+
+```yaml application.yml
+logging:
+  pattern:
+    correlation: '[%X{traceId:-}-%X{spanId:-}] [%X{tenantId:-}] '
+```
+
+`TenantContextFilter` sets the MDC value at the start of each request:
+
+```java TenantContextFilter.java
+private void configureLogs(String tenantId) {
+    MDC.put("tenantId", tenantId);
+}
+```
+
+### Traces
+
+Tenant identity is added as a high-cardinality span attribute (`tenant.id`) so it appears in Tempo trace details.
+
+In the **Instrument Service** and **Chat Service**, `TenantContextFilter` enriches the Micrometer observation context directly:
+
+```java TenantContextFilter.java
+private void configureTraces(String tenantId, HttpServletRequest request) {
+    ServerHttpObservationFilter.findObservationContext(request).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+}
+```
+
+In the **Edge Service**, the `TenantGatewayFilterFactory` does the same for gateway routes:
+
+```java TenantGatewayFilterFactory.java
+/**
+ * Custom filter to extend the AddRequestHeader built-in filter so to
+ * also include tenant information into the ObservabilityContext.
+ */
+@Component
+public class TenantGatewayFilterFactory extends AbstractNameValueGatewayFilterFactory {
+
+    @Override
+    public GatewayFilter apply(NameValueConfig config) {
+        return (exchange, chain) -> {
+            String tenantId = ServerWebExchangeUtils.expand(exchange, config.getValue());
+            ServerHttpRequest request = addTenantToRequest(exchange, tenantId, config);
+            addTenantToObservation(tenantId, exchange);
+            return chain.filter(exchange.mutate().request(request).build());
+        };
+    }
+
+    private void addTenantToObservation(String tenantId, ServerWebExchange exchange) {
+        ServerHttpObservationFilter.findObservationContext(exchange).ifPresent(context ->
+            context.addHighCardinalityKeyValue(KeyValue.of("tenant.id", tenantId)));
+    }
+
+}
+```
+
+---
+
+## Application configuration
+
+Each service sends traces to Alloy over OTLP HTTP and exports Prometheus metrics via the Actuator endpoint:
+
+```yaml application.yml
+management:
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
+  prometheus:
+    metrics:
+      export:
+        step: 5s
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        all: true
+        http.server.requests: true
+  opentelemetry:
+    resource-attributes:
+      application: ${spring.application.name}
+      "service.name": ${spring.application.name}
+```
+
+<Tip>
+`sampling.probability: 1.0` captures every trace. This is appropriate for development but should be reduced (e.g., `0.1`) in production to limit overhead.
+</Tip>
+
+---
+
+## Grafana Alloy configuration
+
+Alloy's full configuration lives at `platform/alloy/config.alloy`. Key sections:
+
+**Trace pipeline** — receives OTLP over HTTP/gRPC, passes through a memory limiter and batcher, then forwards to Tempo:
+
+```alloy platform/alloy/config.alloy
+otelcol.receiver.otlp "default" {
+  grpc { endpoint = "localhost:4317" }
+  http { endpoint = "localhost:4318" }
+  output {
+    traces = [otelcol.processor.memory_limiter.default.input]
+  }
+}
+
+otelcol.exporter.otlp "default" {
+  client {
+    endpoint = env("TEMPO_URL")
+    tls { insecure = true }
+  }
+}
+```
+
+**Metrics scraping** — scrapes Spring Boot Actuator endpoints from all three services:
+
+```alloy platform/alloy/config.alloy
+prometheus.scrape "services" {
+  targets = [
+    { __address__ = "host.docker.internal:80",   __metrics_path__ = "/actuator/prometheus" },
+    { __address__ = "host.docker.internal:8181", __metrics_path__ = "/actuator/prometheus" },
+    { __address__ = "host.docker.internal:8282", __metrics_path__ = "/actuator/prometheus" },
+  ]
+  scrape_interval = "5s"
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+```
+
+**Log collection** — discovers Docker containers and ships their stdout/stderr to Loki:
+
+```alloy platform/alloy/config.alloy
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+loki.source.docker "services" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.write.default.receiver]
+}
+```
+
+<Note>
+The Alloy UI is available at [http://localhost:12345](http://localhost:12345) and shows the live pipeline graph, including component health and data flow rates.
+</Note>
