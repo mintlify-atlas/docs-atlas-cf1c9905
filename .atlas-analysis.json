@@ -1,0 +1,74 @@
+{
+  "projectType": "general",
+  "projectName": "Spring Boot Multitenancy",
+  "projectDescription": "Sample applications demonstrating how to build multitenant Java/Spring Boot services with per-tenant authentication via Keycloak, schema-based data isolation using Hibernate and Flyway, and full-stack observability via Micrometer and Grafana.",
+  "theme": "linden",
+  "primaryColor": "#535353",
+  "lightColor": "#1a1a1a",
+  "darkColor": "#c9c9c9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/services",
+              "architecture/tenant-resolution"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/multitenancy-security",
+              "guides/data-isolation",
+              "guides/observability",
+              "guides/ai-chat"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/configuration",
+              "reference/tenant-context",
+              "reference/faq"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "DNS-based tenant resolution via subdomain routing (e.g., dukes.rock, beans.rock)",
+    "Per-tenant OAuth2/OIDC authentication using Keycloak realms",
+    "Schema-based data isolation with Hibernate multi-tenancy and per-tenant Flyway migrations",
+    "Tenant context propagation via HTTP headers (X-TenantId) through Spring Cloud Gateway",
+    "Tenant-aware caching with custom Spring Cache key generator",
+    "AI chat service with per-tenant document stores using Spring AI + Chroma",
+    "Distributed tracing and metrics with Micrometer, OpenTelemetry, Grafana, Loki, Tempo, and Prometheus",
+    "Testcontainers-based integration testing for PostgreSQL"
+  ],
+  "publicApiSurface": [
+    "GET /instruments — List all instruments for current tenant",
+    "GET /instruments/{type} — Get instruments by type (tenant-aware cache)",
+    "POST /instruments — Add instrument to current tenant",
+    "TenantContextHolder — Thread-local store for current tenant identifier",
+    "TenantDetails record — Core tenant metadata (identifier, enabled, schema, issuer)",
+    "TenantDetailsService — Load tenant details by identifier or all tenants",
+    "TenantAuthenticationManagerResolver — Resolve per-tenant OAuth2 AuthenticationManager",
+    "TenantIdentifierResolver — Hibernate CurrentTenantIdentifierResolver integration",
+    "TenantFlywayMigrationInitializer — Per-tenant schema Flyway migrations on startup",
+    "TenantGatewayFilterFactory — Spring Cloud Gateway filter that propagates tenant to downstream headers and observability context",
+    "TenantClientRegistrationRepository — Dynamic OAuth2 client registrations per tenant",
+    "TenantContextFilter — Servlet filter that resolves and sets tenant from request header"
+  ]
+}
